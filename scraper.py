@@ -2,13 +2,16 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from cryptography.fernet import Fernet, InvalidToken
 
 
 BASE_URL = "https://weebcentral.com"
@@ -41,11 +44,16 @@ class AuthenticationError(ScraperError):
     pass
 
 
+class StateEncryptionError(ScraperError):
+    pass
+
+
 @dataclass
 class SubscriptionRecord:
     name: str
     latest_chapter: str
     latest_chapter_url: str
+    image_url: str
     posted_at: str
     last_read_chapter: str
     has_new_indicator: bool
@@ -60,6 +68,14 @@ def require_env(name: str) -> str:
     if not value:
         raise ScraperError(f"Missing required environment variable: {name}")
     return value
+
+
+def get_state_cipher() -> Fernet:
+    key = require_env("STATE_KEY")
+    try:
+        return Fernet(key.encode("utf-8"))
+    except (ValueError, TypeError) as exc:
+        raise StateEncryptionError("STATE_KEY is not a valid Fernet key.") from exc
 
 
 def build_session(cookie_header: str) -> requests.Session:
@@ -114,8 +130,14 @@ def fetch_subscription_rows(session: requests.Session) -> str:
     try:
         response = session.get(
             SUBSCRIPTIONS_DATA_URL,
-            params={"display_mode": "Full Display"},
-            headers={"HX-Request": "true"},
+            params={"display_mode": "Full Display", "text": ""},
+            headers={
+                "HX-Request": "true",
+                "HX-Current-URL": SUBSCRIPTIONS_URL,
+                "HX-Target": "sub-list",
+                "HX-Trigger": "sub-list",
+                "Referer": SUBSCRIPTIONS_URL,
+            },
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
         )
@@ -136,8 +158,10 @@ def parse_subscriptions(html: str) -> list[SubscriptionRecord]:
     soup = BeautifulSoup(html, "html.parser")
     records: list[SubscriptionRecord] = []
     seen_names: set[str] = set()
+    candidate_count = 0
 
     for container in iter_candidate_containers(soup):
+        candidate_count += 1
         try:
             record = parse_container(container)
         except Exception as exc:  # noqa: BLE001
@@ -150,18 +174,21 @@ def parse_subscriptions(html: str) -> list[SubscriptionRecord]:
         seen_names.add(record.name)
         records.append(record)
 
+    logging.info("Discovered %d candidate containers and parsed %d manga records.", candidate_count, len(records))
     return records
 
 
 def iter_candidate_containers(soup: BeautifulSoup) -> Iterable[Tag]:
     yielded: set[int] = set()
+    boundary = soup.find(id="sub-list")
+    search_root = boundary if isinstance(boundary, Tag) else soup
 
-    for anchor in soup.find_all("a", href=True):
+    for anchor in search_root.find_all("a", href=True):
         href = anchor.get("href", "")
         if "/series/" not in href:
             continue
 
-        container = find_entry_container(anchor)
+        container = find_entry_container(anchor, boundary if isinstance(boundary, Tag) else None)
         container_id = id(container)
         if container_id in yielded:
             continue
@@ -170,19 +197,45 @@ def iter_candidate_containers(soup: BeautifulSoup) -> Iterable[Tag]:
         yield container
 
 
-def find_entry_container(anchor: Tag) -> Tag:
+def find_entry_container(anchor: Tag, boundary: Tag | None) -> Tag:
     current = anchor
-    while current.parent and isinstance(current.parent, Tag):
-        current = current.parent
-        if current.name in {"article", "li", "section"}:
+    while isinstance(current.parent, Tag):
+        parent = current.parent
+        current_series = series_hrefs_in(current)
+        parent_series = series_hrefs_in(parent)
+
+        if boundary is not None and parent is boundary and len(current_series) == 1:
             return current
 
-        if current.name == "div":
-            links = current.find_all("a", href=True)
-            if len(links) >= 2:
-                return current
+        if len(current_series) == 1 and len(parent_series) > 1:
+            return current
 
-    return anchor
+        if boundary is not None and current is boundary:
+            break
+
+        current = parent
+
+    return current
+
+
+def series_hrefs_in(node: Tag) -> set[str]:
+    hrefs: set[str] = set()
+    for anchor in node.find_all("a", href=True):
+        href = normalize_series_href(anchor.get("href", ""))
+        if href:
+            hrefs.add(href)
+    return hrefs
+
+
+def normalize_series_href(href: str) -> str:
+    normalized = href.strip()
+    if not normalized:
+        return ""
+    if normalized.startswith(BASE_URL):
+        normalized = normalized[len(BASE_URL) :]
+    if "/series/" not in normalized:
+        return ""
+    return normalized.split("?", 1)[0].rstrip("/")
 
 
 def parse_container(container: Tag) -> SubscriptionRecord | None:
@@ -199,6 +252,7 @@ def parse_container(container: Tag) -> SubscriptionRecord | None:
     latest_chapter_url = (
         urljoin(BASE_URL, latest_chapter_link.get("href", "")) if latest_chapter_link else ""
     )
+    image_url = extract_image_url(container)
     posted_at = extract_posted_at(container)
     last_read_chapter = extract_last_read(container)
     has_new_indicator = extract_new_indicator(container)
@@ -207,6 +261,7 @@ def parse_container(container: Tag) -> SubscriptionRecord | None:
         name=name,
         latest_chapter=latest_chapter,
         latest_chapter_url=latest_chapter_url,
+        image_url=image_url,
         posted_at=posted_at or "unknown",
         last_read_chapter=last_read_chapter or "unknown",
         has_new_indicator=has_new_indicator,
@@ -294,6 +349,14 @@ def extract_posted_at(container: Tag) -> str:
 
 
 def extract_last_read(container: Tag) -> str:
+    section = find_labeled_section(container, "Last Read")
+    if section:
+        chapter_link = find_latest_chapter_link(section, find_series_link(container) or section)
+        if chapter_link:
+            chapter_text = normalize_space(chapter_link.get_text(" ", strip=True))
+            if chapter_text:
+                return chapter_text
+
     label_node = container.find(string=re.compile(r"last\s*read", re.IGNORECASE))
     if label_node:
         label_text = normalize_space(str(label_node))
@@ -327,15 +390,59 @@ def extract_new_indicator(container: Tag) -> bool:
     return False
 
 
-def load_state() -> dict[str, str]:
+def extract_image_url(container: Tag) -> str:
+    image = container.find("img", src=True)
+    if image:
+        return urljoin(BASE_URL, image.get("src", ""))
+
+    source = container.find("source", srcset=True)
+    if source:
+        first_src = source.get("srcset", "").split(",", 1)[0].strip().split(" ", 1)[0]
+        if first_src:
+            return urljoin(BASE_URL, first_src)
+
+    return ""
+
+
+def find_labeled_section(container: Tag, label: str) -> Tag | None:
+    for section in container.find_all("section"):
+        strong = section.find("strong")
+        if not strong:
+            continue
+        if normalize_space(strong.get_text(" ", strip=True)).rstrip(":").lower() == label.lower():
+            return section
+    return None
+
+
+def load_state(cipher: Fernet) -> dict[str, str]:
     if not STATE_FILE.exists():
         return {}
 
     try:
-        with STATE_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = STATE_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
         raise ScraperError(f"Unable to load state file {STATE_FILE}: {exc}") from exc
+
+    if not raw:
+        return {}
+
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ScraperError(f"Unable to parse plaintext state file {STATE_FILE}: {exc}") from exc
+    else:
+        try:
+            decrypted = cipher.decrypt(raw.encode("utf-8")).decode("utf-8")
+            data = json.loads(decrypted)
+        except InvalidToken as exc:
+            raise StateEncryptionError(
+                "Unable to decrypt state.json. Check that STATE_KEY matches the file."
+            ) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise StateEncryptionError(
+                "Decrypted state.json is not valid JSON. Check that STATE_KEY is correct."
+            ) from exc
 
     if not isinstance(data, dict):
         raise ScraperError(f"State file {STATE_FILE} must contain a JSON object.")
@@ -347,56 +454,191 @@ def load_state() -> dict[str, str]:
     return normalized
 
 
-def save_state(state: dict[str, str]) -> None:
+def save_state(state: dict[str, str], cipher: Fernet) -> None:
     try:
-        with STATE_FILE.open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, ensure_ascii=True, sort_keys=True)
-            handle.write("\n")
+        plaintext = json.dumps(state, ensure_ascii=True, sort_keys=True)
+        encrypted = cipher.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+        STATE_FILE.write_text(encrypted + "\n", encoding="utf-8")
     except OSError as exc:
         raise ScraperError(f"Unable to write state file {STATE_FILE}: {exc}") from exc
 
 
-def build_current_state(records: Iterable[SubscriptionRecord]) -> dict[str, str]:
-    return {record.name: record.latest_chapter for record in records}
-
-
-def compute_notifications(
+def compute_push_candidates(
     records: list[SubscriptionRecord], previous_state: dict[str, str]
 ) -> list[SubscriptionRecord]:
-    if not previous_state:
-        logging.info("State file is empty. Initializing without sending Telegram messages.")
-        return []
-
-    notifications: list[SubscriptionRecord] = []
+    candidates: list[SubscriptionRecord] = []
     for record in records:
-        previous_chapter = previous_state.get(record.name)
-        if previous_chapter is None:
-            notifications.append(record)
+        if not chapter_is_newer(record.latest_chapter, record.last_read_chapter):
             continue
-        if record.latest_chapter != previous_chapter:
-            notifications.append(record)
-    return notifications
+
+        previous_chapter = previous_state.get(record.name)
+        if previous_chapter is None or chapter_is_newer(record.latest_chapter, previous_chapter):
+            candidates.append(record)
+    return candidates
 
 
 def send_telegram_message(token: str, chat_id: str, record: SubscriptionRecord) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    message = (
-        f"{record.name} - New chapter: {record.latest_chapter} - posted: {record.posted_at}\n"
-        f"last read chapter: {record.last_read_chapter}"
-    )
-    payload = {"chat_id": chat_id, "text": message}
+    caption = build_telegram_caption(record)
+    if record.image_url:
+        endpoint = "sendPhoto"
+        payload = {
+            "chat_id": chat_id,
+            "photo": record.image_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+    else:
+        endpoint = "sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": caption,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }
 
     try:
-        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
+        response = post_telegram_request(token, endpoint, payload)
     except requests.RequestException as exc:
-        raise ScraperError(f"Failed to send Telegram message for '{record.name}': {exc}") from exc
+        if endpoint == "sendPhoto":
+            logging.warning(
+                "sendPhoto failed for '%s'. Falling back to sendMessage: %s",
+                record.name,
+                exc,
+            )
+            fallback_payload = {
+                "chat_id": chat_id,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            }
+            try:
+                response = post_telegram_request(token, "sendMessage", fallback_payload)
+            except requests.RequestException as fallback_exc:
+                raise ScraperError(
+                    f"Failed to send Telegram message for '{record.name}': {fallback_exc}"
+                ) from fallback_exc
+        else:
+            raise ScraperError(f"Failed to send Telegram message for '{record.name}': {exc}") from exc
 
-    body = response.json()
+    body = safe_json(response)
     if not body.get("ok"):
+        if endpoint == "sendPhoto":
+            logging.warning(
+                "Telegram rejected sendPhoto for '%s'. Falling back to sendMessage: %s",
+                record.name,
+                body.get("description", "unknown error"),
+            )
+            fallback_payload = {
+                "chat_id": chat_id,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            }
+            fallback_response = post_telegram_request(token, "sendMessage", fallback_payload)
+            fallback_body = safe_json(fallback_response)
+            if not fallback_body.get("ok"):
+                raise ScraperError(
+                    "Telegram API rejected fallback message for "
+                    f"'{record.name}': {fallback_body.get('description', 'unknown error')}"
+                )
+            return
+
         raise ScraperError(
             f"Telegram API rejected message for '{record.name}': {body.get('description', 'unknown error')}"
         )
+
+
+def post_telegram_request(token: str, endpoint: str, payload: dict[str, object]) -> requests.Response:
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/{endpoint}",
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response
+
+
+def safe_json(response: requests.Response) -> dict[str, object]:
+    try:
+        data = response.json()
+    except ValueError:
+        return {"ok": False, "description": "invalid JSON response from Telegram"}
+
+    if isinstance(data, dict):
+        return data
+    return {"ok": False, "description": "unexpected Telegram response shape"}
+
+
+def send_telegram_error(token: str, chat_id: str, message: str) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": f"Notifier error: {message}",
+    }
+    try:
+        response = post_telegram_request(token, "sendMessage", payload)
+    except requests.RequestException as exc:
+        logging.error("Failed to send Telegram error notification: %s", exc)
+        return
+
+    body = safe_json(response)
+    if not body.get("ok"):
+        logging.error(
+            "Telegram API rejected error notification: %s",
+            body.get("description", "unknown error"),
+        )
+
+
+def build_telegram_caption(record: SubscriptionRecord) -> str:
+    posted_at = format_posted_at(record.posted_at)
+    lines = [
+        f"{escape(record.name)} - {escape(record.latest_chapter)}",
+        f"posted on {escape(posted_at)}",
+        f"last read chapter: {escape(record.last_read_chapter)}",
+    ]
+    if record.latest_chapter_url:
+        lines.append(f'<a href="{escape(record.latest_chapter_url, quote=True)}">latest chapter</a>')
+    return "\n".join(lines)
+
+
+def format_posted_at(value: str) -> str:
+    if not value or value == "unknown":
+        return "unknown"
+
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.strftime("%H:%M %d/%m/%y")
+    except ValueError:
+        return value
+
+
+def chapter_is_newer(current: str, baseline: str) -> bool:
+    current_normalized = normalize_space(current)
+    baseline_normalized = normalize_space(baseline)
+
+    if not current_normalized:
+        return False
+    if not baseline_normalized or baseline_normalized.lower() == "unknown":
+        return True
+
+    current_key = chapter_sort_key(current_normalized)
+    baseline_key = chapter_sort_key(baseline_normalized)
+
+    if current_key is not None and baseline_key is not None:
+        return current_key > baseline_key
+
+    return current_normalized.casefold() != baseline_normalized.casefold()
+
+
+def chapter_sort_key(value: str) -> tuple[int, ...] | None:
+    matches = re.findall(r"\d+(?:\.\d+)*", value)
+    if not matches:
+        return None
+
+    parts: list[int] = []
+    for match in matches:
+        parts.extend(int(piece) for piece in match.split("."))
+    return tuple(parts)
 
 
 def normalize_space(value: str) -> str:
@@ -409,6 +651,7 @@ def main() -> int:
     cookie_header = require_env("WEBCOOKIE")
     telegram_token = require_env("TELEGRAM_TOKEN")
     chat_id = require_env("CHAT_ID")
+    state_cipher = get_state_cipher()
 
     session = build_session(cookie_header)
     fetch_main_page(session)
@@ -421,23 +664,42 @@ def main() -> int:
             "Refusing to overwrite state because the page structure may have changed."
         )
 
-    previous_state = load_state()
-    current_state = build_current_state(records)
-    notifications = compute_notifications(records, previous_state)
+    previous_state = load_state(state_cipher)
+    current_state = dict(previous_state)
+    push_candidates = compute_push_candidates(records, previous_state)
 
-    for record in notifications:
+    if not previous_state:
+        logging.info("State file is empty. Initializing without sending Telegram messages.")
+        for record in push_candidates:
+            current_state[record.name] = record.latest_chapter
+        if current_state != previous_state:
+            save_state(current_state, state_cipher)
+            logging.info("Saved state for %d series.", len(current_state))
+        else:
+            logging.info("State did not change.")
+        return 0
+
+    for record in push_candidates:
         send_telegram_message(telegram_token, chat_id, record)
+        current_state[record.name] = record.latest_chapter
         logging.info("Sent notification for %s", record.name)
 
-    save_state(current_state)
-    logging.info("Saved state for %d series.", len(current_state))
+    if current_state != previous_state:
+        save_state(current_state, state_cipher)
+        logging.info("Saved state for %d series.", len(current_state))
+    else:
+        logging.info("State did not change.")
     return 0
 
 
 if __name__ == "__main__":
+    telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.getenv("CHAT_ID", "").strip()
     try:
         raise SystemExit(main())
     except ScraperError as exc:
         logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
+        if telegram_token and chat_id:
+            send_telegram_error(telegram_token, chat_id, str(exc))
         logging.error("%s", exc)
         raise SystemExit(1) from exc
