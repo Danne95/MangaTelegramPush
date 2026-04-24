@@ -90,15 +90,22 @@ def build_session(cookie_header: str) -> requests.Session:
             "Pragma": "no-cache",
         }
     )
+    logging.info(
+        "Session prepared. User-Agent=%s, cookie_length=%d",
+        session.headers.get("User-Agent", ""),
+        len(cookie_header),
+    )
     return session
 
 
 def fetch_main_page(session: requests.Session) -> requests.Response:
+    logging.info("Fetching main subscriptions page: %s", SUBSCRIPTIONS_URL)
     try:
         response = session.get(SUBSCRIPTIONS_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     except requests.RequestException as exc:
         raise ScraperError(f"Failed to fetch subscriptions page: {exc}") from exc
 
+    log_response_summary("main page", response)
     validate_main_page_response(response)
     return response
 
@@ -114,6 +121,7 @@ def validate_main_page_response(response: requests.Response) -> None:
     soup = BeautifulSoup(response.text, "html.parser")
     title = normalize_space(soup.title.get_text(" ", strip=True) if soup.title else "")
     body_text = normalize_space(soup.get_text(" ", strip=True))
+    logging.info("Main page title: %s", title or "<missing>")
 
     if "my subscriptions" not in title.lower():
         raise AuthenticationError(
@@ -127,6 +135,7 @@ def validate_main_page_response(response: requests.Response) -> None:
 
 
 def fetch_subscription_rows(session: requests.Session) -> str:
+    logging.info("Fetching subscription rows: %s", SUBSCRIPTIONS_DATA_URL)
     try:
         response = session.get(
             SUBSCRIPTIONS_DATA_URL,
@@ -147,6 +156,8 @@ def fetch_subscription_rows(session: requests.Session) -> str:
     final_url = response.url.lower()
     if "/auth/" in final_url or "/login" in final_url:
         raise AuthenticationError("Authentication failed while fetching subscription rows.")
+
+    log_response_summary("subscription rows", response)
 
     if response.status_code >= 400:
         raise ScraperError(f"Subscription rows returned HTTP {response.status_code}.")
@@ -424,6 +435,7 @@ def load_state(cipher: Fernet) -> dict[str, str]:
         raise ScraperError(f"Unable to load state file {STATE_FILE}: {exc}") from exc
 
     if not raw:
+        logging.info("state.json is empty.")
         return {}
 
     if raw.startswith("{"):
@@ -451,6 +463,7 @@ def load_state(cipher: Fernet) -> dict[str, str]:
     for key, value in data.items():
         if isinstance(key, str) and isinstance(value, str):
             normalized[key] = value
+    logging.info("Loaded state entries: %d", len(normalized))
     return normalized
 
 
@@ -459,6 +472,7 @@ def save_state(state: dict[str, str], cipher: Fernet) -> None:
         plaintext = json.dumps(state, ensure_ascii=True, sort_keys=True)
         encrypted = cipher.encrypt(plaintext.encode("utf-8")).decode("utf-8")
         STATE_FILE.write_text(encrypted + "\n", encoding="utf-8")
+        logging.info("Encrypted state written. entries=%d", len(state))
     except OSError as exc:
         raise ScraperError(f"Unable to write state file {STATE_FILE}: {exc}") from exc
 
@@ -467,13 +481,25 @@ def compute_push_candidates(
     records: list[SubscriptionRecord], previous_state: dict[str, str]
 ) -> list[SubscriptionRecord]:
     candidates: list[SubscriptionRecord] = []
+    skipped_not_newer_than_last_read = 0
+    skipped_not_newer_than_state = 0
     for record in records:
         if not chapter_is_newer(record.latest_chapter, record.last_read_chapter):
+            skipped_not_newer_than_last_read += 1
             continue
 
         previous_chapter = previous_state.get(record.name)
         if previous_chapter is None or chapter_is_newer(record.latest_chapter, previous_chapter):
             candidates.append(record)
+        else:
+            skipped_not_newer_than_state += 1
+    logging.info(
+        "Push candidate summary: total=%d candidates=%d skipped_last_read=%d skipped_state=%d",
+        len(records),
+        len(candidates),
+        skipped_not_newer_than_last_read,
+        skipped_not_newer_than_state,
+    )
     return candidates
 
 
@@ -645,6 +671,21 @@ def normalize_space(value: str) -> str:
     return " ".join(value.split())
 
 
+def log_response_summary(label: str, response: requests.Response) -> None:
+    snippet = normalize_space(response.text[:300])
+    server = response.headers.get("server", "<missing>")
+    content_type = response.headers.get("content-type", "<missing>")
+    logging.info(
+        "%s response: status=%d final_url=%s server=%s content_type=%s body_snippet=%s",
+        label,
+        response.status_code,
+        response.url,
+        server,
+        content_type,
+        snippet or "<empty>",
+    )
+
+
 def main() -> int:
     configure_logging()
 
@@ -652,6 +693,12 @@ def main() -> int:
     telegram_token = require_env("TELEGRAM_TOKEN")
     chat_id = require_env("CHAT_ID")
     state_cipher = get_state_cipher()
+    logging.info(
+        "Startup checks passed. TELEGRAM_TOKEN_set=%s CHAT_ID_set=%s STATE_KEY_set=%s",
+        bool(telegram_token),
+        bool(chat_id),
+        True,
+    )
 
     session = build_session(cookie_header)
     fetch_main_page(session)

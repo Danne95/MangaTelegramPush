@@ -26,6 +26,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Print run context
+        run: |
+          echo "Workflow run started at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Python version:"
+          python --version
+          echo "state.json exists?"
+          if [ -f state.json ]; then echo "yes"; else echo "no"; fi
+
       - name: Run scraper
         env:
           WEBCOOKIE: ${{ secrets.WEBCOOKIE }}
