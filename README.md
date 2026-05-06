@@ -9,6 +9,9 @@ Built as a lightweight production-style script for GitHub Actions:
 - Telegram Bot API integration with image-first delivery and text fallback
 - scheduled execution and state persistence through GitHub Actions
 
+<img width="350" height="525" alt="Screenshot 2026-05-06 222738" src="https://github.com/user-attachments/assets/3ffce4d5-4821-4821-b806-7beb5ee5bca5" />
+
+
 ## Project Snapshot
 
 **Purpose**
